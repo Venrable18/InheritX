@@ -1,4 +1,5 @@
 #![no_std]
+use access_control::{self, Role};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
     Env, IntoVal, InvokeError, Val, Vec,
@@ -349,6 +350,20 @@ pub struct InsuranceClaimedEvent {
     pub claim_amount: u64,
     pub coverage_amount: u64,
     pub timestamp: u64,
+// Interest Rate Model
+// ─────────────────────────────────────────────────
+
+/// Two-slope interest rate model parameters.
+/// Before optimal utilization: rate = base_rate + (utilization / optimal_utilization) * slope1
+/// After optimal utilization:  rate = base_rate + slope1 + ((utilization - optimal) / (1 - optimal)) * slope2
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateModel {
+    pub base_rate_bps: u32,
+    pub optimal_utilization_bps: u32,
+    pub slope1_bps: u32,
+    pub slope2_bps: u32,
+    pub reserve_factor_bps: u32,
 }
 
 #[contracttype]
@@ -357,6 +372,13 @@ pub struct InsuranceCancelledEvent {
     pub loan_id: u64,
     pub borrower: Address,
     pub refund_amount: u64,
+pub struct RateModelUpdatedEvent {
+    pub base_rate_bps: u32,
+    pub optimal_utilization_bps: u32,
+    pub slope1_bps: u32,
+    pub slope2_bps: u32,
+    pub reserve_factor_bps: u32,
+    pub updated_by: Address,
     pub timestamp: u64,
 }
 
@@ -396,6 +418,8 @@ pub enum LendingError {
     InsuranceAlreadyClaimed = 27,
     InsufficientInsuranceFund = 28,
     InvalidInsuranceAmount = 29,
+    InvalidRateModel = 24,
+    ContractPaused = 25,
 }
 
 // ─────────────────────────────────────────────────
@@ -426,6 +450,7 @@ pub enum DataKey {
     InsurancePremiumRate,      // Premium rate in basis points (default 200 = 2%)
     InheritanceContract,
     GovernanceContract,
+    RateModel,
 }
 
 // ─────────────────────────────────────────────────
@@ -504,7 +529,46 @@ impl LendingContract {
             .instance()
             .set(&DataKey::InsurancePremiumRate, &DEFAULT_INSURANCE_PREMIUM_RATE_BPS);
 
+        access_control::assign_role(&env, &admin, Role::Admin);
         Ok(())
+    }
+
+    /// Assign a role to an address. Admin-only.
+    pub fn assign_role(
+        env: Env,
+        admin: Address,
+        address: Address,
+        role: Role,
+    ) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        access_control::assign_role(&env, &address, role);
+        Ok(())
+    }
+
+    /// Revoke a role from an address. Admin-only.
+    pub fn revoke_role(
+        env: Env,
+        admin: Address,
+        address: Address,
+        role: Role,
+    ) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        access_control::revoke_role(&env, &address, role);
+        Ok(())
+    }
+
+    /// Check whether an address holds a given role.
+    pub fn has_role(env: Env, address: Address, role: Role) -> bool {
+        access_control::has_role(&env, &address, role)
+    }
+
+    /// Return all roles held by an address.
+    pub fn get_roles(env: Env, address: Address) -> Vec<Role> {
+        use access_control::AccessControlKey;
+        env.storage()
+            .persistent()
+            .get(&AccessControlKey::Roles(address))
+            .unwrap_or(Vec::new(&env))
     }
 
     pub fn set_nft_token(env: Env, admin: Address, nft_token: Address) -> Result<(), LendingError> {
@@ -514,17 +578,31 @@ impl LendingContract {
     }
 
     fn enter_reentrancy_guard(env: &Env) -> Result<(), LendingError> {
-        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
-            return Err(LendingError::ReentrantCall);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyGuard, &true);
-        Ok(())
+        access_control::reentrancy_enter(env, LendingError::ReentrantCall)
     }
 
     fn exit_reentrancy_guard(env: &Env) {
-        env.storage().instance().remove(&DataKey::ReentrancyGuard);
+        access_control::reentrancy_exit(env);
+    }
+
+    pub fn pause(env: Env, admin: Address) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        access_control::pause_contract(&env);
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        access_control::unpause_contract(&env);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        access_control::is_contract_paused(&env)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), LendingError> {
+        access_control::require_not_paused(env, LendingError::ContractPaused)
     }
 
     fn get_nft_token(env: &Env) -> Option<Address> {
@@ -592,7 +670,7 @@ impl LendingContract {
             .unwrap_or(false)
     }
 
-    fn get_admin(env: &Env) -> Option<Address> {
+    pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
 
@@ -759,11 +837,7 @@ impl LendingContract {
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), LendingError> {
         caller.require_auth();
-        let admin = Self::get_admin(env).ok_or(LendingError::NotAdmin)?;
-        if *caller != admin {
-            return Err(LendingError::NotAdmin);
-        }
-        Ok(())
+        access_control::require_role(env, caller, Role::Admin, LendingError::NotAdmin)
     }
 
     fn transfer(
@@ -862,6 +936,7 @@ impl LendingContract {
     /// Deposit `amount` of the underlying token into the pool.
     /// Mints proportional pool shares to the depositor.
     pub fn deposit(env: Env, depositor: Address, amount: u64) -> Result<u64, LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
         depositor.require_auth();
@@ -917,6 +992,7 @@ impl LendingContract {
     /// Burn `shares` and return the proportional underlying tokens to the depositor.
     /// Reverts if insufficient liquidity (i.e., tokens are loaned out).
     pub fn withdraw(env: Env, depositor: Address, shares: u64) -> Result<u64, LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
         depositor.require_auth();
@@ -975,6 +1051,7 @@ impl LendingContract {
         collateral_amount: u64,
         duration_seconds: u64,
     ) -> Result<u64, LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
         borrower.require_auth();
@@ -1112,6 +1189,7 @@ impl LendingContract {
     /// Includes principal, interest, and any accumulated late fees in the repayment.
     /// Returns the total amount repaid (principal + interest + late fees).
     pub fn repay(env: Env, borrower: Address) -> Result<u64, LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
         borrower.require_auth();
@@ -1286,6 +1364,7 @@ impl LendingContract {
     /// Withdraw prioritized funds from the retained yield.
     /// Used by authorized contracts (like InheritanceContract) to fulfill priority claims.
     pub fn withdraw_priority(env: Env, caller: Address, amount: u64) -> Result<u64, LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
         caller.require_auth();
@@ -1557,6 +1636,7 @@ impl LendingContract {
     }
 
     pub fn flash_loan(env: Env, receiver_id: Address, amount: u64) -> Result<(), LendingError> {
+        Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         Self::enter_reentrancy_guard(&env)?;
 
@@ -3181,6 +3261,207 @@ impl LendingContract {
 
     pub fn get_governance_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::GovernanceContract)
+    }
+
+    // ─── Interest Rate Model ─────────────────────────
+
+    /// Update the interest rate model parameters. Admin only.
+    pub fn set_rate_model(
+        env: Env,
+        admin: Address,
+        base_rate_bps: u32,
+        optimal_utilization_bps: u32,
+        slope1_bps: u32,
+        slope2_bps: u32,
+        reserve_factor_bps: u32,
+    ) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+
+        if optimal_utilization_bps == 0 || optimal_utilization_bps >= 10000 {
+            return Err(LendingError::InvalidRateModel);
+        }
+        if reserve_factor_bps >= 10000 {
+            return Err(LendingError::InvalidRateModel);
+        }
+
+        let model = RateModel {
+            base_rate_bps,
+            optimal_utilization_bps,
+            slope1_bps,
+            slope2_bps,
+            reserve_factor_bps,
+        };
+
+        env.storage().instance().set(&DataKey::RateModel, &model);
+
+        env.events().publish(
+            (symbol_short!("RATE"), symbol_short!("MODEL")),
+            RateModelUpdatedEvent {
+                base_rate_bps,
+                optimal_utilization_bps,
+                slope1_bps,
+                slope2_bps,
+                reserve_factor_bps,
+                updated_by: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get the base interest rate from the rate model, falling back to pool state.
+    pub fn get_base_rate(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(model.base_rate_bps);
+        }
+        Ok(Self::get_pool(&env).base_rate_bps)
+    }
+
+    /// Get the optimal (target) utilization rate from the rate model.
+    pub fn get_optimal_utilization(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(model.optimal_utilization_bps);
+        }
+        // Default: use utilization cap as the optimal target
+        Ok(Self::get_pool(&env).utilization_cap_bps)
+    }
+
+    /// Get slope1 — the rate increase per unit utilization before optimal utilization.
+    pub fn get_slope1(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(model.slope1_bps);
+        }
+        // Fallback: use pool multiplier as slope1
+        Ok(Self::get_pool(&env).multiplier_bps)
+    }
+
+    /// Get slope2 — the steep rate increase per unit utilization above optimal utilization.
+    pub fn get_slope2(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(model.slope2_bps);
+        }
+        // Fallback: slope2 is 10× slope1 when not configured
+        Ok(Self::get_pool(&env).multiplier_bps.saturating_mul(10))
+    }
+
+    /// Get the current borrow rate using the two-slope model if configured,
+    /// or the legacy linear model otherwise.
+    pub fn get_borrow_rate(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        let pool = Self::get_pool(&env);
+        let utilization_bps = Self::get_utilization_bps(pool.total_borrowed, pool.total_deposits);
+
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(Self::two_slope_rate(&model, utilization_bps));
+        }
+
+        Ok(Self::calculate_dynamic_rate(
+            pool.base_rate_bps,
+            pool.multiplier_bps,
+            utilization_bps,
+        ))
+    }
+
+    /// Get the current supply (deposit) rate.
+    /// supply_rate = borrow_rate × utilization × (1 − reserve_factor)
+    pub fn get_supply_rate(env: Env) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        let pool = Self::get_pool(&env);
+        let utilization_bps = Self::get_utilization_bps(pool.total_borrowed, pool.total_deposits);
+        let borrow_rate = Self::get_borrow_rate(env.clone())?;
+
+        let reserve_factor = if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            model.reserve_factor_bps
+        } else {
+            pool.reserve_factor_bps
+        };
+
+        // supply_rate = borrow_rate * utilization * (10000 - reserve_factor) / 10000^2
+        let supply_rate = (borrow_rate as u128)
+            .checked_mul(utilization_bps as u128)
+            .unwrap_or(0)
+            .checked_mul((10000u32.saturating_sub(reserve_factor)) as u128)
+            .unwrap_or(0)
+            / (10000u128 * 10000u128);
+
+        Ok(supply_rate as u32)
+    }
+
+    /// Simulate the borrow rate at an arbitrary utilization level (in basis points).
+    /// Useful for modelling rate impact before taking on or repaying debt.
+    pub fn simulate_rate(env: Env, utilization_bps: u32) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        if let Some(model) = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel)
+        {
+            return Ok(Self::two_slope_rate(&model, utilization_bps));
+        }
+        let pool = Self::get_pool(&env);
+        Ok(Self::calculate_dynamic_rate(
+            pool.base_rate_bps,
+            pool.multiplier_bps,
+            utilization_bps,
+        ))
+    }
+
+    /// Two-slope interest rate calculation.
+    fn two_slope_rate(model: &RateModel, utilization_bps: u32) -> u32 {
+        let optimal = model.optimal_utilization_bps;
+        if utilization_bps <= optimal {
+            // Linear ramp up to slope1 at optimal utilization
+            let variable = (utilization_bps as u64)
+                .checked_mul(model.slope1_bps as u64)
+                .unwrap_or(0)
+                / optimal as u64;
+            model.base_rate_bps.saturating_add(variable as u32)
+        } else {
+            // Above optimal: base + slope1 + steep slope2 portion
+            let excess = utilization_bps.saturating_sub(optimal);
+            let max_excess = (10000u32).saturating_sub(optimal);
+            let steep = if max_excess == 0 {
+                model.slope2_bps as u64
+            } else {
+                (excess as u64)
+                    .checked_mul(model.slope2_bps as u64)
+                    .unwrap_or(0)
+                    / max_excess as u64
+            };
+            model
+                .base_rate_bps
+                .saturating_add(model.slope1_bps)
+                .saturating_add(steep as u32)
+        }
     }
 
     pub fn verify_plan_ownership(env: Env, plan_id: u64, caller: Address) -> bool {

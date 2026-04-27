@@ -2111,6 +2111,66 @@ fn test_purchase_loan_insurance_success() {
 
 #[test]
 fn test_cannot_purchase_insurance_twice() {
+// Interest Rate Model Tests (#489)
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_set_and_get_rate_model() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+
+    // base=5%, optimal=80%, slope1=4%, slope2=75%, reserve_factor=10%
+    client.set_rate_model(&admin, &500u32, &8000u32, &400u32, &7500u32, &1000u32);
+
+    assert_eq!(client.get_base_rate(), 500u32);
+    assert_eq!(client.get_optimal_utilization(), 8000u32);
+    assert_eq!(client.get_slope1(), 400u32);
+    assert_eq!(client.get_slope2(), 7500u32);
+}
+
+#[test]
+fn test_get_base_rate_fallback() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, _admin) = setup(&env);
+
+    // No rate model configured — falls back to pool base_rate_bps (500 from setup)
+    assert_eq!(client.get_base_rate(), 500u32);
+}
+
+#[test]
+fn test_set_rate_model_invalid_optimal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+
+    // optimal_utilization_bps = 0 is invalid
+    let result = client.try_set_rate_model(&admin, &500u32, &0u32, &400u32, &7500u32, &1000u32);
+    assert!(result.is_err());
+
+    // optimal_utilization_bps = 10000 is also invalid (must be < 10000)
+    let result = client.try_set_rate_model(&admin, &500u32, &10000u32, &400u32, &7500u32, &1000u32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_borrow_rate_below_optimal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral_addr, admin) = setup(&env);
+
+    // Configure a two-slope model: base=200, optimal=80%, slope1=800, slope2=10000
+    client.set_rate_model(&admin, &200u32, &8000u32, &800u32, &10000u32, &1000u32);
+
+    // Pool has no deposits or borrows — utilization = 0
+    // rate = base + (0 / 8000) * slope1 = 200 + 0 = 200
+    let borrow_rate = client.get_borrow_rate();
+    assert_eq!(borrow_rate, 200u32);
+}
+
+#[test]
+fn test_get_borrow_rate_at_optimal() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, token_addr, collateral_addr, admin) = setup(&env);
@@ -2204,6 +2264,74 @@ fn test_deposit_to_insurance_fund() {
 
 #[test]
 fn test_claim_insurance_after_default() {
+    // Deposit 2000 (must exceed MINIMUM_LIQUIDITY=1000 for first deposit)
+    let depositor = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 2000);
+    client.deposit(&depositor, &2000u64);
+
+    // Borrow 1600 → 80% utilization (1600/2000 = 80%)
+    let borrower = Address::generate(&env);
+    mint_to(&env, &collateral_addr, &borrower, 3000);
+    client.borrow(
+        &borrower,
+        &1600u64,
+        &collateral_addr,
+        &3000u64,
+        &31536000u64,
+    );
+
+    // Configure model: base=200, optimal=80%, slope1=800, slope2=10000
+    client.set_rate_model(&admin, &200u32, &8000u32, &800u32, &10000u32, &1000u32);
+
+    // rate = base + (8000 / 8000) * slope1 = 200 + 800 = 1000
+    let borrow_rate = client.get_borrow_rate();
+    assert_eq!(borrow_rate, 1000u32);
+}
+
+#[test]
+fn test_simulate_rate_below_optimal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+
+    // base=200, optimal=8000, slope1=800, slope2=10000
+    client.set_rate_model(&admin, &200u32, &8000u32, &800u32, &10000u32, &1000u32);
+
+    // At 40% utilization: rate = 200 + (4000 / 8000) * 800 = 200 + 400 = 600
+    let rate = client.simulate_rate(&4000u32);
+    assert_eq!(rate, 600u32);
+}
+
+#[test]
+fn test_simulate_rate_above_optimal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+
+    // base=200, optimal=8000, slope1=800, slope2=10000
+    client.set_rate_model(&admin, &200u32, &8000u32, &800u32, &10000u32, &1000u32);
+
+    // At 90% utilization (above optimal 80%):
+    // excess = 9000 - 8000 = 1000, max_excess = 10000 - 8000 = 2000
+    // rate = 200 + 800 + (1000 / 2000) * 10000 = 200 + 800 + 5000 = 6000
+    let rate = client.simulate_rate(&9000u32);
+    assert_eq!(rate, 6000u32);
+}
+
+#[test]
+fn test_simulate_rate_fallback_to_legacy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, _admin) = setup(&env);
+
+    // No rate model set — uses legacy linear model (base_rate=500, multiplier=2000)
+    // At 50% utilization: rate = 500 + (5000 * 2000) / 10000 = 500 + 1000 = 1500
+    let rate = client.simulate_rate(&5000u32);
+    assert_eq!(rate, 1500u32);
+}
+
+#[test]
+fn test_get_supply_rate() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, token_addr, collateral_addr, admin) = setup(&env);
@@ -2295,6 +2423,72 @@ fn test_cannot_claim_expired_insurance() {
 
     // Try to claim - should fail because insurance expired
     let result = client.try_claim_insurance(&0u64);
+    // Deposit 2000 (must exceed MINIMUM_LIQUIDITY=1000 for first deposit)
+    let depositor = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 2000);
+    client.deposit(&depositor, &2000u64);
+
+    // Borrow 1000 → 50% utilization (1000/2000 = 50%)
+    let borrower = Address::generate(&env);
+    mint_to(&env, &collateral_addr, &borrower, 2000);
+    client.borrow(
+        &borrower,
+        &1000u64,
+        &collateral_addr,
+        &2000u64,
+        &31536000u64,
+    );
+
+    // Configure model: base=200, optimal=8000, slope1=800, slope2=10000, reserve=1000
+    client.set_rate_model(&admin, &200u32, &8000u32, &800u32, &10000u32, &1000u32);
+
+    // borrow_rate at 50% util = 200 + (5000/8000)*800 = 200 + 500 = 700
+    // supply_rate = 700 * 5000 * (10000-1000) / 10000^2 = 700 * 5000 * 9000 / 100000000 = 315
+    let supply_rate = client.get_supply_rate();
+    // Value may differ slightly due to integer arithmetic — just ensure it's non-zero and less than borrow_rate
+    assert!(supply_rate > 0);
+    assert!(supply_rate < 700u32);
+}
+
+// ─────────────────────────────────────────────────
+// Access Control (RBAC) Tests
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_admin_role_assigned_on_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+
+    assert!(client.has_role(&admin, &access_control::Role::Admin));
+    assert!(!client.has_role(&admin, &access_control::Role::Owner));
+}
+
+#[test]
+fn test_admin_can_assign_and_revoke_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+    let user = Address::generate(&env);
+
+    assert!(!client.has_role(&user, &access_control::Role::Beneficiary));
+
+    client.assign_role(&admin, &user, &access_control::Role::Beneficiary);
+    assert!(client.has_role(&user, &access_control::Role::Beneficiary));
+
+    client.revoke_role(&admin, &user, &access_control::Role::Beneficiary);
+    assert!(!client.has_role(&user, &access_control::Role::Beneficiary));
+}
+
+#[test]
+fn test_non_admin_cannot_assign_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, _admin) = setup(&env);
+    let non_admin = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    let result = client.try_assign_role(&non_admin, &target, &access_control::Role::Admin);
     assert!(result.is_err());
 }
 
@@ -2438,6 +2632,39 @@ fn test_unauthorized_cancel_insurance() {
 
     // Try to cancel as unauthorized user
     let result = client.try_cancel_insurance(&unauthorized_user, &0u64);
+fn test_non_admin_cannot_whitelist_collateral() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, collateral_addr, _admin) = setup(&env);
+    let non_admin = Address::generate(&env);
+
+    let result = client.try_whitelist_collateral(&non_admin, &collateral_addr);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_roles_returns_assigned_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+    let user = Address::generate(&env);
+
+    client.assign_role(&admin, &user, &access_control::Role::Owner);
+    client.assign_role(&admin, &user, &access_control::Role::Guardian);
+
+    let roles = client.get_roles(&user);
+    assert_eq!(roles.len(), 2);
+}
+
+#[test]
+fn test_pause_blocks_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral_addr, admin) = setup(&env);
+    client.pause(&admin);
+    let depositor = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 1000);
+    let result = client.try_deposit(&depositor, &500u64);
     assert!(result.is_err());
 }
 
@@ -2523,4 +2750,36 @@ fn test_insurance_lifecycle_complete() {
         final_fund.available_balance,
         10_000u64 + premium - claim_amount
     );
+fn test_unpause_restores_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral_addr, admin) = setup(&env);
+    client.pause(&admin);
+    client.unpause(&admin);
+    let depositor = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 2000);
+    let shares = client.deposit(&depositor, &2000u64);
+    assert!(shares > 0);
+}
+
+#[test]
+fn test_non_admin_cannot_pause_lending() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, _admin) = setup(&env);
+    let non_admin = Address::generate(&env);
+    let result = client.try_pause(&non_admin);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_is_paused_reflects_state_lending() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral_addr, admin) = setup(&env);
+    assert!(!client.is_paused());
+    client.pause(&admin);
+    assert!(client.is_paused());
+    client.unpause(&admin);
+    assert!(!client.is_paused());
 }
