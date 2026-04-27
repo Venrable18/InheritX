@@ -117,9 +117,21 @@ pub trait FlashLoanReceiverInterface {
     fn execute_operation(env: Env, amount: u64, fee: u64, initiator: Address);
 }
 
+#[soroban_sdk::contractclient(name = "InheritanceContractClient")]
+pub trait InheritanceContractInterface {
+    fn verify_plan_ownership(env: Env, plan_id: u64, user: Address) -> bool;
+}
+
 // ─────────────────────────────────────────────────
 // Events
 // ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractLinkedEvent {
+    pub contract_type: soroban_sdk::Symbol,
+    pub address: Address,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,6 +424,8 @@ pub enum DataKey {
     Insurance(u64),            // Insurance record for a loan_id
     InsuranceFund,             // Global insurance fund state
     InsurancePremiumRate,      // Premium rate in basis points (default 200 = 2%)
+    InheritanceContract,
+    GovernanceContract,
 }
 
 // ─────────────────────────────────────────────────
@@ -3114,6 +3128,70 @@ impl LendingContract {
 
         Ok(())
     }
+
+    // ─── Cross-Contract Integration ──────────────────────────────
+
+    pub fn set_inheritance_contract(
+        env: Env,
+        admin: Address,
+        contract: Address,
+    ) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::InheritanceContract, &contract);
+        env.events().publish(
+            (
+                soroban_sdk::symbol_short!("LINK"),
+                soroban_sdk::symbol_short!("INHERIT"),
+            ),
+            ContractLinkedEvent {
+                contract_type: soroban_sdk::symbol_short!("INHERIT"),
+                address: contract,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_inheritance_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::InheritanceContract)
+    }
+
+    pub fn set_governance_contract(
+        env: Env,
+        admin: Address,
+        contract: Address,
+    ) -> Result<(), LendingError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceContract, &contract);
+        env.events().publish(
+            (
+                soroban_sdk::symbol_short!("LINK"),
+                soroban_sdk::symbol_short!("GOV"),
+            ),
+            ContractLinkedEvent {
+                contract_type: soroban_sdk::symbol_short!("GOV"),
+                address: contract,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_governance_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceContract)
+    }
+
+    pub fn verify_plan_ownership(env: Env, plan_id: u64, caller: Address) -> bool {
+        if let Some(inheritance_contract) = Self::get_inheritance_contract(env.clone()) {
+            let client = InheritanceContractClient::new(&env, &inheritance_contract);
+            client.verify_plan_ownership(&plan_id, &caller)
+        } else {
+            false
+        }
+    }
 }
 
+mod cross_contract_test;
 mod test;
